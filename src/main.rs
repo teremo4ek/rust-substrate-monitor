@@ -1,5 +1,6 @@
 use futures::StreamExt;
 use sp_keyring::AccountKeyring;
+use std::time::Duration;
 use subxt::{
     tx::PairSigner,
     OnlineClient,
@@ -9,159 +10,44 @@ use subxt::{
 #[subxt::subxt(runtime_metadata_path = "./metadata/metadata.scale")]
 pub mod polkadot {}
 
+/// Subscribe to all events, and then manually look through them and
+/// pluck out the events that we care about.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    //simple_transfer().await?;
-    //simple_transfer_separate_events().await?;
-    handle_transfer_events().await?;
-
-    Ok(())
-}
-
-/// This is the highest level approach to using this API. We use `wait_for_finalized_success`
-/// to wait for the transaction to make it into a finalized block, and also ensure that the
-/// transaction was successful according to the associated events.
-async fn simple_transfer() -> Result<(), Box<dyn std::error::Error>> {
-    println!("simple_transfer");
-    let signer = PairSigner::new(AccountKeyring::Alice.pair());
-    let dest = AccountKeyring::Bob.to_account_id().into();
-
+    // Create a client to use:
     let api = OnlineClient::<PolkadotConfig>::new().await?;
 
-    let balance_transfer_tx = polkadot::tx().balances().transfer(dest, 13_000);
+    // Subscribe to any events that occur:
+    let mut event_sub = api.events().subscribe().await?;
 
-    let balance_transfer = api
-        .tx()
-        .sign_and_submit_then_watch_default(&balance_transfer_tx, &signer)
-        .await?
-        .wait_for_finalized_success()
-        .await?;
+    // Our subscription will see the events emitted as a result of this:
+    while let Some(events) = event_sub.next().await {
+        let events = events?;
+        let block_hash = events.block_hash();
 
-    let transfer_event =
-        balance_transfer.find_first::<polkadot::balances::events::Transfer>()?;
+        // We can dynamically decode events:
+        for event in events.iter() {
+            let event = event?;
+            let is_balance_transfer = event
+                .as_event::<polkadot::balances::events::Transfer>()?
+                .is_some();
+            let pallet = event.pallet_name();
+            let variant = event.variant_name();
+            if is_balance_transfer {
+                println!("  Dynamic event details: {block_hash:?}:");
+                println!("    {pallet}::{variant} (is balance transfer? {is_balance_transfer})");
+            }
+        }
 
-    if let Some(event) = transfer_event {
-        println!("Balance transfer success: {event:?}");
-    } else {
-        println!("Failed to find Balances::Transfer Event");
-    }
-    Ok(())
-}
-
-/// This is very similar to `simple_transfer`, except to show that we can handle
-/// waiting for the transaction to be finalized separately from obtaining and checking
-/// for success on the events.
-async fn simple_transfer_separate_events() -> Result<(), Box<dyn std::error::Error>> {
-    println!("simple_transfer_separate_events");
-    let signer = PairSigner::new(AccountKeyring::Alice.pair());
-    let dest = AccountKeyring::Bob.to_account_id().into();
-
-    let api = OnlineClient::<PolkadotConfig>::new().await?;
-
-    let balance_transfer_tx = polkadot::tx().balances().transfer(dest, 12_000);
-
-    let balance_transfer = api
-        .tx()
-        .sign_and_submit_then_watch_default(&balance_transfer_tx, &signer)
-        .await?
-        .wait_for_finalized()
-        .await?;
-
-    // Now we know it's been finalized, we can get hold of a couple of
-    // details, including events. Calling `wait_for_finalized_success` is
-    // equivalent to calling `wait_for_finalized` and then `wait_for_success`:
-    let _events = balance_transfer.wait_for_success().await?;
-
-    // Alternately, we could just `fetch_events`, which grabs all of the events like
-    // the above, but does not check for success, and leaves it up to you:
-    let events = balance_transfer.fetch_events().await?;
-
-    let failed_event =
-        events.find_first::<polkadot::system::events::ExtrinsicFailed>()?;
-
-    if let Some(_ev) = failed_event {
-        // We found a failed event; the transfer didn't succeed.
-        println!("Balance transfer failed");
-    } else {
-        // We didn't find a failed event; the transfer succeeded. Find
-        // more details about it to report..
+        // Or we can find the first transfer event, ignoring any others:
         let transfer_event =
             events.find_first::<polkadot::balances::events::Transfer>()?;
-        if let Some(event) = transfer_event {
-            println!("Balance transfer success: {event:?}");
-        } else {
-            println!("Failed to find Balances::Transfer Event");
-        }
-    }
 
-    Ok(())
-}
-
-/// If we need more visibility into the state of the transaction, we can also ditch
-/// `wait_for_finalized` entirely and stream the transaction progress events, handling
-/// them more manually.
-async fn handle_transfer_events() -> Result<(), Box<dyn std::error::Error>> {
-    println!("handle_transfer_events");
-    let signer = PairSigner::new(AccountKeyring::Alice.pair());
-    let dest = AccountKeyring::Bob.to_account_id().into();
-
-    let api = OnlineClient::<PolkadotConfig>::new().await?;
-
-    let balance_transfer_tx = polkadot::tx().balances().transfer(dest, 11_000);
-
-    let mut balance_transfer_progress = api
-        .tx()
-        .sign_and_submit_then_watch_default(&balance_transfer_tx, &signer)
-        .await?;
-
-    while let Some(ev) = balance_transfer_progress.next().await {
-        let ev = ev?;
-        use subxt::tx::TxStatus::*;
-
-        // Made it into a block, but not finalized.
-        if let InBlock(details) = ev {
-            println!(
-                "Transaction {:?} made it into block {:?}",
-                details.extrinsic_hash(),
-                details.block_hash()
-            );
-
-            let events = details.wait_for_success().await?;
-            let transfer_event =
-                events.find_first::<polkadot::balances::events::Transfer>()?;
-
-            if let Some(event) = transfer_event {
-                println!(
-                    "Balance transfer is now in block (but not finalized): {event:?}"
-                );
-            } else {
-                println!("Failed to find Balances::Transfer Event");
-            }
-        }
-        // Finalized!
-        else if let Finalized(details) = ev {
-            println!(
-                "Transaction {:?} is finalized in block {:?}",
-                details.extrinsic_hash(),
-                details.block_hash()
-            );
-
-            let events = details.wait_for_success().await?;
-            let transfer_event =
-                events.find_first::<polkadot::balances::events::Transfer>()?;
-
-            if let Some(event) = transfer_event {
-                println!("Balance transfer success: {event:?}");
-            } else {
-                println!("Failed to find Balances::Transfer Event");
-            }
-        }
-        // Report other statuses we see.
-        else {
-            println!("Current transaction status: {:?}", ev);
-        }
+        if let Some(ev) = transfer_event {
+            println!("  - Balance transfer success: from {:?} - to {:?} - value: {:?}", ev.from, ev.to, ev.amount);
+        } 
     }
 
     Ok(())
